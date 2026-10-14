@@ -107,6 +107,12 @@ uv pip install flash_attn==2.7.4.post1 --no-build-isolation
 ```
 
 
+> **Intel GPU (XPU) inference:** Psi0 supports inference on Intel GPUs. After `uv sync` above, install the XPU-enabled PyTorch wheels:
+> ```bash
+> uv pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/xpu
+> ```
+> Skip the `flash_attn` installation on XPU; FlashAttention is CUDA-only and Psi0 uses PyTorch SDPA when it is unavailable. The serving CLI defaults to `cuda:0`, so explicitly pass `--device xpu:0` when serving on XPU.
+
 Test installation, a version number should be displayed.
 ```bash
 python -c "import psi;print(psi.__version__);"
@@ -511,6 +517,8 @@ uv run --active --group psi --group serve serve_psi0 \
   --action-exec-horizon=24 \
   --rtc
 ```
+
+For Intel XPU, add `--device xpu:0` to the command above.
 
 Run open-loop evaluation (offline)
 
