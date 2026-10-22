@@ -80,7 +80,9 @@ class DatasetChunkInferer:
         num_inference_steps: int = 8,
     ) -> np.ndarray:
         """Infers action chunk and applies inverse maxmin normalization."""
-        processed_img = self._preprocess_image(bgr_frame)
+
+        # Add batch dimension: (B=1, views=1)
+        processed_img = [self._preprocess_image(bgr_frame)]
         processed_obs = self._preprocess_state(raw_state)
 
         norm_actions = self.model.predict_action(
@@ -89,7 +91,7 @@ class DatasetChunkInferer:
             traj2ds=None,
             instructions=[instruction.lower()],
             num_inference_steps=num_inference_steps,
-        )[0].float().detach().cpu().numpy()  # (H, Da)
+        )[0].float().detach().cpu().numpy()
 
         return self.maxmin.denormalize(norm_actions)
 
@@ -155,8 +157,13 @@ class DatasetChunkInferer:
                 "episode_index": int(row.get("episode_index", 0)),
                 "frame_index": int(frame_idx),
                 "query_timestamp": base_timestamp,
-                "step_timestamps": chunk_timestamps,
-                "actions": actions.tolist(),  # (H, Da)
+                "actions": [
+                    {
+                        "timestamp": timestamp,
+                        "action": action.tolist(),
+                    }
+                    for timestamp, action in zip(chunk_timestamps, actions)
+                ],
             }
             all_episode_chunks.append(chunk_record)
 
@@ -184,18 +191,55 @@ class DatasetChunkInferer:
 # -------------------------------------------------------------------------
 # Usage
 # -------------------------------------------------------------------------
-if __name__ == "__main__":
-    RUN_DIR = Path("/path/to/checkpoint_dir")
-    VIDEO_PATH = Path("/path/to/episode_0.mp4")
-    PARQUET_PATH = Path("/path/to/episode_0.parquet")
-    OUTPUT_DIR = Path("./action_chunks/episode_0")
 
-    inferer = DatasetChunkInferer(run_dir=RUN_DIR, ckpt_step="latest")
-    inferer.process_episode(
-        video_path=VIDEO_PATH,
-        parquet_path=PARQUET_PATH,
-        output_dir=OUTPUT_DIR,
-        instruction="pick up the object",
-        step_stride=5,  # Matches MIN_EXEC_HORIZON
-        ctrl_hz=30.0,    # 30Hz control clock
+if __name__ == "__main__":
+    RUN_DIR = Path(
+        "/home/wenjing/Documents/nick/Psi0/.runs/sonic/merged-handshake-no-coinft.real.flow1000.cosine.lr1.0e-04.b16.gpus1.2609211738"
     )
+
+    BASE_DIR = Path(
+        "/home/wenjing/Documents/nick/Psi0/third_party/GR00T-WholeBodyControl/outputs/merged-handshake-no-coinft"
+    )
+
+    VIDEO_DIR = BASE_DIR / "videos/chunk-000/observation.images.ego_view"
+    PARQUET_DIR = BASE_DIR / "data/chunk-000"
+    OUTPUT_BASE_DIR = Path("./action_chunks")
+
+    inferer = DatasetChunkInferer(
+        run_dir=RUN_DIR,
+        ckpt_step="40000",
+        device="cuda:0",
+    )
+
+    for episode_idx in range(41):  # episode 0 through episode 40
+        episode_name = f"episode_{episode_idx:06d}"
+
+        VIDEO_PATH = VIDEO_DIR / f"{episode_name}.mp4"
+        PARQUET_PATH = PARQUET_DIR / f"{episode_name}.parquet"
+        OUTPUT_DIR = OUTPUT_BASE_DIR / f"episode_{episode_idx}"
+
+        # Skip episodes whose input files are missing
+        if not VIDEO_PATH.exists():
+            print(f"Skipping {episode_name}: video not found: {VIDEO_PATH}")
+            continue
+
+        if not PARQUET_PATH.exists():
+            print(f"Skipping {episode_name}: parquet not found: {PARQUET_PATH}")
+            continue
+
+        print(f"\n{'=' * 60}")
+        print(f"Processing {episode_name} ({episode_idx + 1}/41)")
+        print(f"{'=' * 60}")
+
+        inferer.process_episode(
+            video_path=VIDEO_PATH,
+            parquet_path=PARQUET_PATH,
+            output_dir=OUTPUT_DIR,
+            instruction=(
+                "Wait for a person to approach and extend their right hand, shake their hand, then return to rest."
+            ),
+            step_stride=5,
+            ctrl_hz=30.0,
+        )
+
+    print("\nFinished processing all episodes.")
