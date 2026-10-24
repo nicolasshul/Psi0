@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
@@ -10,7 +11,8 @@ from pathlib import Path
 from typing import Callable, Optional
 import importlib.resources as resources
 import zipfile
-# if TYPE_CHECKING:
+if TYPE_CHECKING:
+    from psi.data.gear.schema.lerobot import StateActionMetadata
 import numpy as np
 import torch
 from PIL import Image
@@ -291,11 +293,20 @@ def count_parameters(model, trainable: bool = False):
     # print(f"Total parameters: {total_params:,}")
     # print(f"Trainable parameters: {trainable_params:,}")
 
-def str_to_tensor(s: str):
-    return torch.tensor(list(s.encode('utf-8')), dtype=torch.uint8)
+def str_to_tensor(s: str, max_length: int | None = None, pad_value: int = 0) -> torch.Tensor:
+    data = list(s.encode("utf-8"))
+    if max_length is not None:
+        data = data[:max_length]
+        if len(data) < max_length:
+            data = data + [pad_value] * (max_length - len(data))
+    return torch.tensor(data, dtype=torch.uint8)
 
-def tensor_to_str(t):
-    return bytes(t.tolist()).decode('utf-8')
+def tensor_to_str(t: torch.Tensor, strip_trailing_pad: bool = True, pad_value: int = 0) -> str:
+    values = t.tolist()
+    if strip_trailing_pad:
+        while len(values) > 0 and values[-1] == pad_value:
+            values.pop()
+    return bytes(values).decode("utf-8")
 
 def string_compatible_collate(batch):
     
@@ -337,14 +348,29 @@ def batch_str_to_tensor(batch: T) -> T:
 # wrote for pytests
 def extract_args_from_shell_script(script_path):
     """Extract arguments from a shell script that uses accelerate launch"""
-    
+
     with open(script_path, 'r') as f:
         content = f.read()
-    
-    # Extract from args variable if it exists
-    args_match = re.search(r'args="([^"]+)"', content, re.DOTALL)
+
+    # Extract from args variable if it exists; anchor the closing quote to its own
+    # line so inner quotes (e.g. $(date +"%y%m%d%H%M")) don't truncate the block.
+    args_match = re.search(r'args="(.*?)\n"', content, re.DOTALL) or \
+        re.search(r'args="([^"]+)"', content, re.DOTALL)
     if args_match:
         args_content = args_match.group(1)
+        # poor-man's shell expansion so tokens stay whitespace-splittable:
+        # $(date +FMT) via strftime, then ${VAR:-default} from env or default
+        from datetime import datetime
+        args_content = re.sub(
+            r'\$\(date \+"?([^")]+)"?\)',
+            lambda m: datetime.now().strftime(m.group(1)),
+            args_content,
+        )
+        args_content = re.sub(
+            r'\$\{(\w+):-([^}]*)\}',
+            lambda m: os.environ.get(m.group(1)) or m.group(2),
+            args_content,
+        )
         # Split by backslash and newline, clean up
         args_list = [
             arg.strip().rstrip('\\').strip()
@@ -419,7 +445,7 @@ def make_image_grid(images, nrows=None, ncols=None):
     else:
         ncols = int(np.ceil(num_images / nrows))
     
-    H, W = images[0].size
+    W,H   = images[0].size
     grid = Image.new("RGB", size=(ncols * W, nrows * H))
 
     for i, image in enumerate(images):
@@ -455,6 +481,16 @@ def pad_to_len(x, target_len, dim=1, pad_value=0.0):
     mask[tuple(idx)] = False
     return padded, mask
 
+def split_by_modality(data, modality_metadata: dict[str, StateActionMetadata]):
+    # split data dimmension according to modality metadata, return dict of modality to data
+    result = {}
+    start = 0
+    for mod, meta in modality_metadata.items():
+        end = start + meta.shape[0]
+        result[mod] = data[..., start:end]
+        start = end
+    return result
+
 def dreamzero_instantiate(config, *args, **kwargs):
     from hydra.utils import instantiate
     from omegaconf import DictConfig, OmegaConf
@@ -473,3 +509,89 @@ def dreamzero_instantiate(config, *args, **kwargs):
 
     _patch(config)
     return instantiate(config, *args, **kwargs)
+
+
+def cfg_json_default(o):
+    """json.dump default handler for pydantic config objects containing torch/numpy types."""
+    from enum import Enum
+    if isinstance(o, torch.dtype):
+        return str(o)
+    if isinstance(o, Enum):
+        return o.value
+    if isinstance(o, (torch.Tensor, np.ndarray)):
+        return o.tolist()
+    if isinstance(o, np.dtype):
+        return str(o)
+    if isinstance(o, (np.integer, np.floating)):
+        return o.item()
+    return repr(o)
+
+
+# Fields added to the model config after some checkpoints were already trained. A
+# run_config.json written before the field existed carries no entry for it, and
+# pydantic then fills in today's default -- which silently changes what the loaded
+# weights compute (same parameter shapes, different forward). Serving must reproduce
+# the head the checkpoint was trained with, so back-fill the pre-flag behaviour
+# whenever the key is absent.
+#
+#   final_layer_norm: the action head. False is the legacy `x * scale + shift`;
+#     True (today's default) is `LayerNorm(x) * (1 + scale) + shift`. Both have the
+#     same weights, so a legacy checkpoint loads clean and then emits garbage
+#     actions -- the policy runs, the robot fails the task.
+#   state_drop_prob / state_as_action_token: proprio-state handling. Pre-flag runs
+#     were trained with the state as an always-present token in the VLM context, i.e.
+#     no dropout and no action-stream token. These currently equal the class defaults
+#     and are listed so the trained-with value survives any future default change.
+#   state_null_token: added after state_as_action_token, so runs from between the two
+#     flags carry the former but not the latter. All of them were trained WITHOUT the
+#     learned null token; a True default would hand them a fresh, untrained parameter
+#     that state_drop_prob>0 would then substitute in.
+#   dropout / state_feature_dropout: both were HARD-CODED in ObservationProjection (0.1 on
+#     the context tokens, 0.2 element-wise on the raw state) and ignored the config until
+#     they were wired up. Every pre-wiring run_config.json happens to record dropout=0.1,
+#     the value that was actually compiled in, so that one is a no-op today and is listed
+#     only to pin it against a future default change. state_feature_dropout did not exist,
+#     so it MUST be back-filled to 0.2 -- today's recipes set 0.0, and taking that default
+#     for a legacy checkpoint would serve a state encoder the weights were not trained for.
+#
+# The value recorded here is what the checkpoint was TRAINED with, regardless of the
+# current class default; the loader only warns when the two differ.
+LEGACY_MODEL_CONFIG_DEFAULTS: dict[str, Any] = {
+    "final_layer_norm": False,
+    "state_drop_prob": 0.0,
+    "state_as_action_token": False,
+    "state_null_token": False,
+    "dropout": 0.1,
+    "state_feature_dropout": 0.2,
+}
+
+def apply_legacy_model_config_defaults(conf: dict[str, Any]) -> dict[str, Any]:
+    """Fill model-config keys a pre-flag run_config.json does not carry (in place).
+
+    Warns only when the back-filled value differs from today's class default, i.e.
+    when relying on pydantic's default would have changed the loaded model's forward.
+    """
+    model_conf = conf.get("model")
+    if not isinstance(model_conf, dict):
+        return conf
+    from psi.config.model_psi0 import Psi0ModelConfig  # local: psi.config imports psi.utils
+    for key, legacy_value in LEGACY_MODEL_CONFIG_DEFAULTS.items():
+        if key not in model_conf:
+            model_conf[key] = legacy_value
+            field = Psi0ModelConfig.model_fields.get(key)
+            if field is None or field.default != legacy_value:
+                print(f"[legacy ckpt] run_config.json predates `model.{key}`; "
+                      f"serving with {key}={legacy_value} (the value it was trained with)")
+    return conf
+
+def load_launch_config(run_dir: Path | str):
+    """Rebuild the LaunchConfig a checkpoint was trained with, from its run dir.
+
+    Reads argv.txt for the config class and run_config.json for the values, then
+    back-fills the defaults of any config field added after the run was written.
+    """
+    run_dir = Path(run_dir)
+    config_ = parse_args_to_tyro_config(run_dir / "argv.txt")
+    conf = apply_legacy_model_config_defaults(
+        json.loads((run_dir / "run_config.json").read_text()))
+    return config_.model_validate(conf)

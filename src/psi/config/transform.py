@@ -491,6 +491,14 @@ class RealRepackTransform(LerobotRepackTransform):
     num_past_frames: int = 0
     action_chunk_size: int = 30
 
+    # Temporal state augmentation (skipped when the transform kwargs carry no_aug=True,
+    # i.e. val split / deploy), same semantics as SonicRepackTransform: the proprio state
+    # paired with (o_t, a_t..a_{t+Tp-1}) is s_{t+k}, k ~ U{-J..J} frames
+    # (J = state_temporal_jitter), with probability state_temporal_jitter_prob; else k = 0.
+    # LeRobot clamps the window to the episode (boundary frame repeated). 0 = off.
+    state_temporal_jitter: int = 0
+    state_temporal_jitter_prob: float = 1.0
+
     pad_action_dim: int | None = None
     pad_state_dim: int | None = None
 
@@ -499,12 +507,24 @@ class RealRepackTransform(LerobotRepackTransform):
         for image_key in self.image_keys:
             delta[image_key] = [-t/fps for t in range(self.num_past_frames, -1, -1)]
 
-        delta[self.state_key] = [-t/fps for t in range(self.num_past_frames, -1, -1)]
+        J = self.state_temporal_jitter
+        # [-(past+J) .. +J]; __call__ slices the (past+1)-frame window at offset k.
+        delta[self.state_key] = [t/fps for t in range(-(self.num_past_frames + J), J + 1)]
         delta[self.action_key] = [t/fps for t in range(self.action_chunk_size)]
         return delta
 
     def __call__(self, data: dict[str, Any], **kwargs) -> dict[str, Any]:
-        states, _ = pad_to_len(data[self.state_key], self.pad_state_dim) if self.pad_state_dim is not None else (data[self.state_key], None)
+        states = np.array(data[self.state_key])  # (past+1+2J, Ds)
+        J = self.state_temporal_jitter
+        if J > 0:
+            k = 0
+            if not kwargs.get("no_aug", False) and np.random.rand() < self.state_temporal_jitter_prob:
+                k = int(np.random.randint(-J, J + 1))
+            # window index of s_t is past+J; keep the (past+1) frames ending at s_{t+k}
+            end = self.num_past_frames + J + k + 1
+            states = states[end - (self.num_past_frames + 1):end]
+        if self.pad_state_dim is not None:
+            states, _ = pad_to_len(states, self.pad_state_dim)
 
         if self.pad_action_dim is not None:
             actions, mask = pad_to_len(data[self.action_key], self.pad_action_dim)
@@ -595,6 +615,11 @@ class ActionStateTransform(FieldTransform):
     state_max: Optional[List[float]] = None
     normalize_state: bool = False  # whether to normalize states
 
+    # Gaussian noise on the NORMALIZED state (needs normalize_state; skipped when the
+    # transform kwargs carry no_aug=True): N(0, std) per dim in [-1, 1] units, skipping
+    # constant/padded dims, clipped back to [-1, 1]. 0.05 = 2.5% of a dim's range. 0 = off.
+    state_noise_std: float = 0.0
+
     pad_action_dim: int | None = None
     pad_state_dim: int | None = None
 
@@ -636,6 +661,8 @@ class ActionStateTransform(FieldTransform):
         action_max = np.array(self.action_max, dtype=np.float32)
         if self.normalize_state:
             data["states"] = self.normalize_state_func(data["states"])
+            if self.state_noise_std > 0 and not kwargs.get("no_aug", False):
+                data["states"] = self.perturb_state(data["states"])
 
         # tolerate near-zero, not just exact zero
         ill_mask = np.abs(action_max - action_min) < 1e-4 * (np.abs(action_max) + np.abs(action_min) + 1e-8) 
@@ -658,6 +685,15 @@ class ActionStateTransform(FieldTransform):
         data["actions"] = actions
 
         return data
+
+    def perturb_state(self, states: np.ndarray) -> np.ndarray:
+        """Additive Gaussian noise on normalized states; constant (zero-range/padded) dims untouched."""
+        state_min = np.array(self.state_min, dtype=np.float32)
+        state_max = np.array(self.state_max, dtype=np.float32)
+        live = np.abs(state_max - state_min) >= 1e-4 * (np.abs(state_max) + np.abs(state_min) + 1e-8)
+        noise = np.random.normal(0.0, self.state_noise_std, size=states.shape).astype(np.float32)
+        noise *= live.astype(np.float32)
+        return np.clip(states + noise, -1, 1).astype(np.float32)
 
     def normalize(self, action, **kwargs):
         data = {"actions": action}
@@ -1013,7 +1049,14 @@ class Psi0ModelTransform(ModelTransform):
     color_jitter: ColorJitter = Field(default_factory=lambda: ColorJitter())
     gaussian_noise: GaussianNoise = Field(default_factory=lambda: GaussianNoise(mean=0, std=3, prob_skip=0.1))
     img_aug: bool = False
-    
+
+    # Random crop-and-resize-back viewport perturbation, applied after resize+center_crop
+    # at that resolution, before the color jitter. Like img_aug it is skipped when the
+    # caller passes no_aug=True (val split, deploy, mock clients).
+    view_aug: bool = False
+    view_aug_min_scale: float = 0.85
+    view_aug_prob: float = 1.0
+
     # for mixed dataset with different image sizes
     adaptive_resize: bool = False
     img_sizes: dict[str, Any] = Field(default_factory=lambda: {
@@ -1028,7 +1071,9 @@ class Psi0ModelTransform(ModelTransform):
             ...
             data["observations"]: List of PIL Images
         """
-        do_img_aug = False if no_aug else self.img_aug
+        # no_aug=True (val split, deploy, mock clients) disables every image augmentation.
+        do_img_aug = self.img_aug and not no_aug
+        do_view_aug = self.view_aug and not no_aug
         if self.adaptive_resize:
             assert data["dataset"] is not None
             match data["dataset"]:
@@ -1040,16 +1085,22 @@ class Psi0ModelTransform(ModelTransform):
                     target_size = (256, 256)
             resizer = ResizeImage(size=tuple(target_size))() # type: ignore
             center_crop = CenterCrop(size=tuple(target_size))() # type: ignore
+            view_size = tuple(target_size)
         else:
             resizer = self.resize()
             center_crop = self.center_crop()
-            
+            view_size = self.center_crop.size
+            if isinstance(view_size, int):
+                view_size = (view_size, view_size)
+
         t1 = v2.Compose([
             resizer,
             center_crop,
+            RandomViewPerturb(size=tuple(view_size), min_scale=self.view_aug_min_scale, prob=self.view_aug_prob)()
+                if do_view_aug else v2.Identity(),
             self.color_jitter() if do_img_aug else v2.Identity(),
         ])
-        
+
         images = [t1(img) for img in data["observations"]]
         instruction = data["instruction"]
 

@@ -36,7 +36,7 @@ import requests
 from tqdm.auto import tqdm
 from transformers import AutoProcessor
 
-from psi.utils import parse_args_to_tyro_config, seed_everything
+from psi.utils import parse_args_to_tyro_config, seed_everything, apply_legacy_model_config_defaults
 from psi.utils.overwatch import initialize_overwatch
 from psi.config.config import LaunchConfig
 from psi.deploy.helpers import RequestMessage, ResponseMessage
@@ -101,8 +101,9 @@ def parse_args():
 
 def load_config(run_dir: Path) -> LaunchConfig:
     config_: LaunchConfig = parse_args_to_tyro_config(run_dir / "argv.txt")  # type: ignore
-    conf = (run_dir / "run_config.json").read_text()
-    return config_.model_validate_json(conf)
+    conf = apply_legacy_model_config_defaults(
+        json.loads((run_dir / "run_config.json").read_text()))
+    return config_.model_validate(conf)
 
 
 def denormalize_state(norm_state: np.ndarray, field) -> np.ndarray:
@@ -289,6 +290,7 @@ def main():
     if args.root_dir:
         data_cfg.root_dir = args.root_dir
     if args.repo_id:
+        data_cfg.root_dir =  args.root_dir
         data_cfg.train_repo_ids = [args.repo_id]
         data_cfg.val_repo_ids = [args.repo_id]
         overwatch.warning(f"dataset overridden to {data_cfg.root_dir}/{args.repo_id} — L1 is "
